@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"github.com/hashicorp/hcl-lang/decoder"
+	"github.com/hashicorp/hcl-lang/lang"
 	lsp "github.com/hashicorp/terraform-ls/internal/protocol"
 	"github.com/zclconf/go-cty/cty"
 )
@@ -10,33 +11,57 @@ func DocumentSymbols(sbs []decoder.Symbol, caps lsp.DocumentSymbolClientCapabili
 	symbols := make([]lsp.DocumentSymbol, len(sbs))
 
 	for i, s := range sbs {
-		kind, ok := symbolKind(s, caps.SymbolKind.ValueSet)
+		symbol, ok := documentSymbol(s, caps)
 		if !ok {
 			// skip symbol not supported by client
 			continue
 		}
-
-		symbols[i] = lsp.DocumentSymbol{
-			Name:           s.Name(),
-			Kind:           kind,
-			Range:          HCLRangeToLSP(s.Range()),
-			SelectionRange: HCLRangeToLSP(s.Range()),
-		}
-
-		if caps.HierarchicalDocumentSymbolSupport {
-			symbols[i].Children = DocumentSymbols(s.NestedSymbols(), caps)
-		}
+		symbols[i] = symbol
 	}
 	return symbols
 }
 
-func symbolKind(symbol decoder.Symbol, supported []lsp.SymbolKind) (lsp.SymbolKind, bool) {
+func documentSymbol(symbol decoder.Symbol, caps lsp.DocumentSymbolClientCapabilities) (lsp.DocumentSymbol, bool) {
+	supported := caps.SymbolKind.ValueSet
+
+	var kind lsp.SymbolKind
+	var ok bool
+
 	switch s := symbol.(type) {
 	case *decoder.BlockSymbol:
-		return supportedSymbolKind(supported, lsp.Class)
+		kind, ok = supportedSymbolKind(supported, lsp.Class)
+		if !ok {
+			return lsp.DocumentSymbol{}, false
+		}
+
 	case *decoder.AttributeSymbol:
-		// Only primitive types are supported at this point
-		switch s.Type {
+		kind, ok = exprSymbolKind(s.ExprKind, supported)
+		if !ok {
+			return lsp.DocumentSymbol{}, false
+		}
+	case *decoder.ExprSymbol:
+		kind, ok = exprSymbolKind(s.ExprKind, supported)
+		if !ok {
+			return lsp.DocumentSymbol{}, false
+		}
+	}
+
+	ds := lsp.DocumentSymbol{
+		Name:           symbol.Name(),
+		Kind:           kind,
+		Range:          HCLRangeToLSP(symbol.Range()),
+		SelectionRange: HCLRangeToLSP(symbol.Range()),
+	}
+	if caps.HierarchicalDocumentSymbolSupport {
+		ds.Children = DocumentSymbols(symbol.NestedSymbols(), caps)
+	}
+	return ds, true
+}
+
+func exprSymbolKind(symbolKind lang.SymbolExprKind, supported []lsp.SymbolKind) (lsp.SymbolKind, bool) {
+	switch k := symbolKind.(type) {
+	case lang.LiteralTypeKind:
+		switch k.Type {
 		case cty.Bool:
 			return supportedSymbolKind(supported, lsp.Boolean)
 		case cty.String:
@@ -44,11 +69,15 @@ func symbolKind(symbol decoder.Symbol, supported []lsp.SymbolKind) (lsp.SymbolKi
 		case cty.Number:
 			return supportedSymbolKind(supported, lsp.Number)
 		}
-
-		return supportedSymbolKind(supported, lsp.Variable)
+	case lang.TraversalExprKind:
+		return supportedSymbolKind(supported, lsp.Constant)
+	case lang.TupleConsExprKind:
+		return supportedSymbolKind(supported, lsp.Array)
+	case lang.ObjectConsExprKind:
+		return supportedSymbolKind(supported, lsp.Struct)
 	}
 
-	return lsp.SymbolKind(0), false
+	return supportedSymbolKind(supported, lsp.Variable)
 }
 
 func supportedSymbolKind(supported []lsp.SymbolKind, kind lsp.SymbolKind) (lsp.SymbolKind, bool) {
